@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hashtag Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://unpkg.com/papaparse@latest/papaparse.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chrono-node/1.3.11/chrono.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.15.0/Recharts.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [data, setData] = useState([]);
+      const [selectedHashtag, setSelectedHashtag] = useState('#travel');
+      const [selectedDate, setSelectedDate] = useState('');
+      const [prediction, setPrediction] = useState(null);
+      const [peakDate, setPeakDate] = useState(null);
+      const [isLoading, setIsLoading] = useState(true);
+      const [error, setError] = useState(null);
+
+      const hashtags = [
+        '#covid19', '#crypto', '#bitcoin', '#ukraine', '#travel',
+        '#mondaymotivation', '#christmas', '#iran', '#realestate'
+      ];
+
+      // Load and parse CSV data
+      useEffect(() => {
+        fetch('/data/Hashtag_sum_2_10.csv')
+          .then(response => {
+            if (!response.ok) throw new Error('Không thể tải file CSV');
+            return response.text();
+          })
+          .then(csvText => {
+            Papa.parse(csvText, {
+              header: true,
+              skipEmptyLines: true,
+              dynamicTyping: false,
+              transformHeader: header => header.trim().replace(/^"|"$/g, ''),
+              transform: (value, header) => {
+                let cleaned = value.trim().replace(/^"|"$/g, '');
+                if (header !== 'date') {
+                  return isNaN(parseFloat(cleaned)) ? 0 : parseFloat(cleaned);
+                }
+                return cleaned;
+              },
+              complete: (results) => {
+                const cleanedData = results.data
+                  .map(row => ({
+                    ...row,
+                    date: chrono.parseDate(row['date']),
+                    dateStr: row['date']
+                  }))
+                  .filter(row => row.date instanceof Date && !isNaN(row.date))
+                  .sort((a, b) => a.date - b.date);
+                if (cleanedData.length === 0) {
+                  setError('Không tìm thấy dữ liệu hợp lệ trong dataset.');
+                  setIsLoading(false);
+                  return;
+                }
+                setData(cleanedData);
+                setIsLoading(false);
+              },
+              error: (err) => {
+                setError('Lỗi khi phân tích CSV: ' + err.message);
+                setIsLoading(false);
+              }
+            });
+          })
+          .catch(err => {
+            setError('Lỗi khi tải CSV: ' + err.message);
+            setIsLoading(false);
+          });
+      }, []);
+
+      // Sample data for chart (one point per week)
+      const sampleChartData = (data, hashtag) => {
+        const sortedData = data.filter(row => row[hashtag] !== undefined);
+        const sampled = [];
+        let lastDate = null;
+        sortedData.forEach(row => {
+          const currentDate = new Date(row.date);
+          if (!lastDate || (currentDate - lastDate) >= 7 * 24 * 60 * 60 * 100) {
+            sampled.push({ date: currentDate, [hashtag]: row[hashtag] });
+            lastDate = currentDate;
+          }
+        });
+        return sampled;
+      };
+
+      // Detect changepoints for piecewise linear trend
+      const detectChangepoints = (data, hashtag) => {
+        const validData = data.filter(row => row[hashtag] !== undefined);
+        if (validData.length < 10) return [];
+        const changes = [];
+        const threshold = 50;
+        for (let i = 1; i < validData.length - 1; i++) {
+          const diff = Math.abs(validData[i][hashtag] - validData[i - 1][hashtag]);
+          if (diff > threshold && changes.length < 5) {
+            changes.push(validData[i].date.getTime());
+          }
+        }
+        return changes.sort((a, b) => a - b);
+      };
+
+      // Calculate trend using piecewise linear regression
+      const calculateTrend = (data, hashtag, targetTime) => {
+        const validData = data.filter(row => row[hashtag] !== undefined);
+        if (validData.length < 2) return 0;
+        const changepoints = detectChangepoints(data, hashtag);
+        let segmentData = [];
+        let startIdx = 0;
+        changepoints.forEach(cp => {
+          const segment = validData.slice(startIdx).filter(row => row.date.getTime() <= cp);
+          startIdx = validData.findIndex(row => row.date.getTime() > cp);
+          if (segment.length > 1) segmentData.push(segment);
+        });
+        if (startIdx < validData.length) {
+          segmentData.push(validData.slice(startIdx));
+        }
+
+        let trend = 0;
+        segmentData.forEach(segment => {
+          if (segment.length < 2) return;
+          const x = segment.map(row => row.date.getTime());
+          const y = segment.map(row => row[hashtag]);
+          const n = x.length;
+          const sumX = x.reduce((a, b) => a + b, 0);
+          const sumY = y.reduce((a, b) => a + b, 0);
+          const sumXY = x.reduce((a, b, i) => a + b * y[i], 0);
+          const sumXX = x.reduce((a, b) => a + b * b, 0);
+          const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+          const intercept = (sumY - slope * sumX) / n;
+          if (targetTime >= segment[0].date.getTime() && targetTime <= segment[segment.length - 1].date.getTime()) {
+            trend = slope * targetTime + intercept;
+          }
+        });
+        return trend < 0 ? 0 : trend;
+      };
+
+      // Calculate yearly seasonality using Fourier series
+      const calculateSeasonality = (targetTime) => {
+        const period = 365.25 * 24 * 60 * 60 * 1000;
+        const t = (targetTime % period) / period;
+        let seasonality = 0;
+        for (let i = 1; i <= 4; i++) {
+          seasonality += Math.sin(2 * Math.PI * i * t) + Math.cos(2 * Math.PI * i * t);
+        }
+        return seasonality * 10;
+      };
+
+      // Prophet-like prediction
+      const performProphetPrediction = (data, hashtag, targetDate) => {
+        const validData = data.filter(row => row[hashtag] !== undefined);
+        if (validData.length < 2) return null;
+        const targetTime = new Date(targetDate).getTime();
+        const trend = calculateTrend(data, hashtag, targetTime);
+        const seasonality = calculateSeasonality(targetTime);
+        const prediction = trend + seasonality;
+        return Math.max(0, Math.round(prediction));
+      };
+
+      // Find peak date
+      const findPeakDate = (data, hashtag) => {
+        let maxCount = -Infinity;
+        let peak = null;
+        data.forEach(row => {
+          const count = row[hashtag] || 0;
+          if (count > maxCount) {
+            maxCount = count;
+            peak = row.dateStr;
+          }
+        });
+        return peak;
+      };
+
+      // Handle hashtag change
+      const handleHashtagChange = (e) => {
+        setSelectedHashtag(e.target.value);
+        setPrediction(null);
+        setSelectedDate('');
+        setError(null);
+      };
+
+      // Handle date change and prediction
+      const handleDateChange = (e) => {
+        const date = e.target.value;
+        setSelectedDate(date);
+        if (date) {
+          const selectedDateObj = new Date(date);
+          const minDate = new Date(data[0]?.date || '2013-01-01');
+          if (selectedDateObj < minDate || isNaN(selectedDateObj)) {
+            setError('Vui lòng chọn ngày từ 2013-01-01 trở đi.');
+            setPrediction(null);
+            return;
+          }
+          const predictedValue = performProphetPrediction(data, selectedHashtag, date);
+          if (predictedValue === null) {
+            setError(`Không đủ dữ liệu cho ${selectedHashtag} để dự đoán.`);
+          } else {
+            setError(null);
+            setPrediction(predictedValue);
+          }
+        } else {
+          setPrediction(null);
+          setError(null);
+        }
+      };
+
+      // Render line chart
+      const renderLineChart = () => {
+        const chartData = sampleChartData(data, selectedHashtag);
+        return (
+          <Recharts.ResponsiveContainer width={800} height={500}>
+            <Recharts.LineChart data={chartData}>
+              <Recharts.CartesianGrid stroke="#444" />
+              <Recharts.XAxis
+                dataKey="date"
+                tickFormatter={(date) => new Date(date).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}
+                stroke="#fff"
+                style={{ fontSize: 13 }}
+                interval="preserveStartEnd"
+              />
+              <Recharts.YAxis stroke="#fff" style={{ fontSize: 13 }} />
+              <Recharts.Tooltip
+                formatter={(value) => [value, 'Count']}
+                labelFormatter={(date) => new Date(date).toLocaleDateString('en-GB')}
+              />
+              <Recharts.Line
+                type="monotone"
+                dataKey={selectedHashtag}
+                stroke="#10B981"
+                strokeWidth={2}
+                dot={false}
+              />
+            </Recharts.LineChart>
+          </Recharts.ResponsiveContainer>
+        );
+      };
+
+      // Update peak date
+      useEffect(() => {
+        if (data.length > 0) {
+          setPeakDate(findPeakDate(data, selectedHashtag));
+        }
+      }, [selectedHashtag, data]);
+
+      // Handle loading and error states
+      if (isLoading) {
+        return <div className="text-2xl text-center">Đang tải dữ liệu...</div>;
+      }
+      if (error) {
+        return <div className="text-red-400 text-center text-lg">{error}</div>;
+      }
+
+      // Main UI
+      return (
+        <div className="container mx-auto p-4 max-w-5xl">
+          <h1 className="text-3xl font-bold mb-6 text-center">Biểu đồ tần suất HashTag</h1>
+          <div className="flex flex-col sm:flex-row items-center justify-center mb-6 gap-4">
+            <label className="text-lg font-medium">Hãy chọn chủ đề bạn muốn quan sát:</label>
+            <select
+              value={selectedHashtag}
+              onChange={handleHashtagChange}
+              className="p-2 bg-gray-800 text-white rounded w-full sm:w-48"
+            >
+              {hashtags.map(hashtag => (
+                <option key={hashtag} value={hashtag}>{hashtag}</option>
+              ))}
+            </select>
+            <button
+              onClick={() => setSelectedHashtag(selectedHashtag)}
+              className="p-2 bg-emerald-600 hover:bg-emerald-700 rounded w-full sm:w-auto"
+            >
+              Khám phá
+            </button>
+          </div>
+          <div className="mb-6 bg-gray-800 p-4 rounded-lg shadow-lg">
+            {renderLineChart()}
+          </div>
+          {peakDate && (
+            <p className="text-center mb-4 text-gray-300">
+              <span className="font-semibold">Thông tin thú vị:</span> Ngày cao điểm của {selectedHashtag} là {peakDate} với số bài đăng cao nhất.
+            </p>
+          )}
+          <div className="flex flex-col sm:flex-row items-center justify-center mb-4 gap-4">
+            <label className="text-lg font-medium">Chọn ngày để dự đoán:</label>
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={handleDateChange}
+              min="2013-01-01"
+              max="2026-12-31"
+              className="p-2 bg-gray-800 text-white rounded w-full sm:w-48"
+            />
+          </div>
+          {selectedDate ? (
+            prediction !== null ? (
+              <div className="text-center mt-4 p-4 bg-emerald-800 rounded-lg shadow-lg">
+                <p className="text-lg font-semibold">
+                  Dự đoán số lượng bài đăng cho {selectedHashtag} vào ngày {selectedDate}: 
+                  <span className="text-yellow-300"> {prediction}</span>
+                </p>
+                <p className="text-sm text-gray-300 mt-2">
+                  Dự đoán này sử dụng mô hình Prophet với xu hướng và tính mùa vụ hàng năm dựa trên dữ liệu từ 2013 đến 2023.
+                </p>
+              </div>
+            ) : (
+              <p className="text-center text-red-400">Không thể dự đoán: Không đủ dữ liệu cho {selectedHashtag}.</p>
+            )
+          ) : (
+            <p className="text-center text-gray-400">Vui lòng chọn ngày để xem dự đoán.</p>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
